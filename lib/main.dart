@@ -1,40 +1,18 @@
 import 'package:flutter/material.dart';
-import 'package:audio_service/audio_service.dart';
 import 'package:audio_session/audio_session.dart';
 import 'services/api_service.dart';
 import 'services/storage_service.dart';
 import 'services/player_service.dart';
 import 'services/download_service.dart';
-import 'services/audio_handler.dart';
+import 'services/native_player.dart';
 import 'screens/setup_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/book_list_screen.dart';
 import 'screens/player_screen.dart';
 import 'screens/download_screen.dart';
 
-/// 全局 handler 引用，main() 创建，AppShell 连接
-AudioPlayerHandler? globalHandler;
-
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-
-  globalHandler = AudioPlayerHandler();
-  try {
-    await AudioService.init(
-      builder: () => globalHandler!,
-      config: AudioServiceConfig(
-        androidNotificationChannelId: 'com.gtmatch.audiobook',
-        androidNotificationChannelName: 'GT听书',
-        androidNotificationOngoing: true,
-        androidStopForegroundOnPause: false,
-      ),
-    );
-  } catch (e) {
-    // AudioService 初始化失败，通知栏不可用但app正常运行
-    debugPrint('AudioService init: $e');
-    globalHandler = null;
-  }
-
   runApp(const GTAudiobookApp());
 }
 
@@ -82,6 +60,7 @@ class _AppShellState extends State<AppShell> {
   late StorageService _storageService;
   late PlayerService _playerService;
   late DownloadService _downloadService;
+  final NativePlayer _nativePlayer = NativePlayer();
 
   @override
   void initState() {
@@ -102,9 +81,8 @@ class _AppShellState extends State<AppShell> {
     }
 
     _downloadService = DownloadService(_apiService, _storageService);
-    _playerService = PlayerService(_apiService, downloadService: _downloadService, storageService: _storageService);
 
-    // 配置 audio_session（允许后台播放）
+    // 配置 audio_session（让后台播放和蓝牙可用）
     final session = await AudioSession.instance;
     await session.configure(const AudioSessionConfiguration(
       avAudioSessionCategory: AVAudioSessionCategory.playback,
@@ -119,9 +97,14 @@ class _AppShellState extends State<AppShell> {
       androidWillPauseWhenDucked: true,
     ));
 
-    // 将全局 handler 连接到播放器
-    globalHandler?.bindPlayer(_playerService.player);
-    _playerService.setHandler(globalHandler);
+    // 等待原生 MediaController 就绪
+    await _nativePlayer.waitReady;
+    _playerService = PlayerService(
+      _apiService,
+      downloadService: _downloadService,
+      storageService: _storageService,
+      nativePlayer: _nativePlayer,
+    );
 
     _playerService.onPlayStateChanged = () {
       if (mounted) setState(() {});

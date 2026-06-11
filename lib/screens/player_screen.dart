@@ -60,8 +60,10 @@ class _PlayerScreenState extends State<PlayerScreen> with TickerProviderStateMix
     };
 
     _checkDownloads();
-    // 首帧渲染后滚动到当前播放集居中
-    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToCurrent());
+    // 首帧渲染后延迟滚动到当前播放集居中（等待ListView完成布局）
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      Future.delayed(const Duration(milliseconds: 200), _scrollToCurrent);
+    });
   }
 
   @override
@@ -94,15 +96,14 @@ class _PlayerScreenState extends State<PlayerScreen> with TickerProviderStateMix
   }
 
   void _scrollToCurrent() {
-    if (!_scrollCtrl.hasClients) return;
+    if (!_scrollCtrl.hasClients || _ps.chapters.isEmpty) return;
     final idx = _ps.currentIndex;
-    // 估算行高约48px，滚动到当前行居中
-    final offset = (idx * 48.0) - (_scrollCtrl.position.viewportDimension / 2) + 24;
-    _scrollCtrl.animateTo(
-      offset.clamp(0.0, _scrollCtrl.position.maxScrollExtent),
-      duration: const Duration(milliseconds: 300),
-      curve: Curves.easeOut,
-    );
+    final itemHeight = 52.0;
+    final offset = (idx * itemHeight) - (_scrollCtrl.position.viewportDimension / 2) + (itemHeight / 2);
+    final clamped = offset.clamp(0.0, _scrollCtrl.position.maxScrollExtent);
+    if (clamped > 0) {
+      _scrollCtrl.jumpTo(clamped);
+    }
   }
 
   void _onChapterTap(int index) {
@@ -374,7 +375,7 @@ class _PlayerScreenState extends State<PlayerScreen> with TickerProviderStateMix
     if (_ps.sleepMode == SleepMode.off) {
       return ActionChip(avatar: const Icon(Icons.timer_outlined, size: 18), label: const Text('定时关闭'), onPressed: _showTimerDialog);
     }
-    String label = _ps.sleepMode == SleepMode.time ? '⏱ ${_ps.sleepRemainingMinutes}分钟' : '⏱ 剩${_ps.sleepRemainingChapters}集';
+    String label = _ps.sleepMode == SleepMode.minutes ? '⏱ ${_ps.sleepRemainingMinutes}分钟' : '⏱ 剩${_ps.sleepRemainingChapters}集';
     return ActionChip(
         avatar: const Icon(Icons.timer, size: 18, color: Colors.orange),
         label: Text(label),

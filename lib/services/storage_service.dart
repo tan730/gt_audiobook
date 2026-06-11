@@ -68,6 +68,17 @@ class StorageService {
     return _prefs.getInt(key) ?? 0;
   }
 
+  /// 保存章节播放位置
+  Future<void> saveChapterPosition(String bookName, int chapterIndex, int positionMs, int durationMs) async {
+    final key = 'cpos_${bookName}_$chapterIndex';
+    if (durationMs > 0 && (durationMs - positionMs) < 2000) {
+      // 几乎播完，视为完成，清除记录
+      await _prefs.remove(key);
+    } else if (positionMs > 0) {
+      await _prefs.setInt(key, positionMs);
+    }
+  }
+
   /// 清除某章节的保存位置（播完时调用）
   Future<void> clearChapterPosition(String bookName, int chapterIndex) async {
     final key = 'cpos_${bookName}_$chapterIndex';

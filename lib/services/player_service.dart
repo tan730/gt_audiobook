@@ -1,113 +1,146 @@
 import 'dart:async';
-import 'dart:math';
-import 'dart:ui';
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:just_audio/just_audio.dart';
 import '../models/chapter.dart';
 import 'api_service.dart';
 import 'download_service.dart';
-import 'audio_handler.dart';
 import 'storage_service.dart';
-import 'foreground_service.dart';
+import 'native_player.dart';
 
-/// 播放服务 - 音频播放引擎 + 后台服务
+/// 播放服务 - 调用原生 ExoPlayer 引擎，实现锁屏/通知栏/蓝牙控制
 class PlayerService {
-  final AudioPlayer _player = AudioPlayer();
   final ApiService _apiService;
-  DownloadService? _downloadService;
-  StorageService? _storageService;
-  AudioPlayerHandler? _handler;
+  final DownloadService? _downloadService;
+  final StorageService? _storageService;
+  final NativePlayer _nativePlayer;
 
-  void setHandler(AudioPlayerHandler? h) => _handler = h;
-
-  void _updateMeta() {
-    if (_handler == null || _chapters.isEmpty || _currentIndex >= _chapters.length) return;
-    _handler!.setMeta(_bookName, _chapters[_currentIndex].displayName);
-  }
-
+  String _bookName = '';
   List<Chapter> _chapters = [];
   int _currentIndex = 0;
-  String _bookName = '';
+  String _lastAudioUrl = '';
+  Timer? _pollTimer;
 
   // 定时关闭
   Timer? _sleepTimer;
   SleepMode _sleepMode = SleepMode.off;
   int _sleepRemainingMinutes = 0;
   int _sleepRemainingChapters = 0;
-  bool _manualSwitch = false;  // 手动切章标记，防止假触发_onChapterComplete
-  bool _chapterEndFired = false;  // 防止positionStream多次触发章节末尾
+  bool _manualSwitch = false;
+  bool _chapterEndFired = false;
 
   // 回调
-  VoidCallback? onProgressChanged;
-  VoidCallback? onChapterChanged;
-  VoidCallback? onPlayStateChanged;
+  Function()? onProgressChanged;
+  Function()? onChapterChanged;
+  Function()? onPlayStateChanged;
   void Function(String message)? onError;
 
-  PlayerService(this._apiService, {DownloadService? downloadService, StorageService? storageService})
-      : _downloadService = downloadService, _storageService = storageService {
+  PlayerService(
+    this._apiService, {
+    DownloadService? downloadService,
+    StorageService? storageService,
+    required NativePlayer nativePlayer,
+  })  : _downloadService = downloadService,
+        _storageService = storageService,
+        _nativePlayer = nativePlayer {
     _setupListeners();
   }
 
-  /// 设置下载服务（用于离线播放）
-  void setDownloadService(DownloadService ds) => _downloadService = ds;
-
-  AudioPlayer get player => _player;
+  String get bookName => _bookName;
   List<Chapter> get chapters => _chapters;
   int get currentIndex => _currentIndex;
-  String get bookName => _bookName;
-  SleepMode get sleepMode => _sleepMode;
-  int get sleepRemainingMinutes => _sleepRemainingMinutes;
-  int get sleepRemainingChapters => _sleepRemainingChapters;
+  bool get isPlaying => _isPlayingCache;
+  double get speed => _speedCache;
+  Duration get duration => Duration(milliseconds: _durationCache);
+  Duration get position => Duration(milliseconds: _positionCache);
+  int get positionMs => _positionCache;
+  int get durationMs => _durationCache;
+  String get currentChapterName =>
+      _currentIndex < _chapters.length ? _chapters[_currentIndex].displayName : '';
 
-  bool get isPlaying => _player.playing;
-  Duration? get position => _player.position;
-  Duration? get duration => _player.duration;
-  Stream<Duration?> get positionStream => _player.positionStream;
-  Stream<Duration?> get durationStream => _player.durationStream;
-  Stream<PlayerState> get playerStateStream => _player.playerStateStream;
-  Stream<LoopMode> get loopModeStream => _player.loopModeStream;
+  // 缓存值（定时轮询原生播放器获取）
+  bool _isPlayingCache = false;
+  double _speedCache = 1.0;
+  int _positionCache = 0;
+  int _durationCache = 0;
+  int _lastSeenIndex = 0;
 
-  // 倍速
-  double get speed => _player.speed;
-  Future<void> setSpeed(double speed) async {
-    await _player.setSpeed(speed);
-    if (_bookName.isNotEmpty) _storageService?.setSpeed(_bookName, speed);
+  AudioPlayer? _compatPlayer; // 仅用于兼容 just_audio 接口
+
+  /// 兼容旧调用，返回占位 AudioPlayer
+  AudioPlayer get player {
+    _compatPlayer ??= AudioPlayer();
+    return _compatPlayer!;
   }
-
-  // 进度
-  Future<void> seek(Duration position) => _player.seek(position);
 
   void _setupListeners() {
-    _player.positionStream.listen((pos) => _onPositionUpdate(pos));
-    _player.playerStateStream.listen((state) {
+    _nativePlayer.onPlayingChanged = (playing) {
+      _isPlayingCache = playing;
       onPlayStateChanged?.call();
-      // 后台保活：播放时启动前台服务，暂停时停止
-      if (state.playing && _bookName.isNotEmpty) {
-        final ch = _currentIndex < _chapters.length ? _chapters[_currentIndex].displayName : _bookName;
-        ForegroundService.start(ch);
-      } else {
-        ForegroundService.stop();
+      if (!playing) {
+        // 暂停/停止时把进度保存
+        _saveAllProgress();
       }
-    });
-    _player.currentIndexStream.listen((index) {
-      if (index != null && index != _currentIndex) {
-        _manualSwitch = false;
-        _chapterEndFired = false;
-        _currentIndex = index;
-        _updateMeta();
-        onChapterChanged?.call();
-      }
-    });
+    };
+
+    _nativePlayer.onPositionDiscontinuity = () {
+      onChapterChanged?.call();
+    };
+
+    // 启动轮询
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(const Duration(milliseconds: 500), (_) => _pollState());
   }
 
-  void _onPositionUpdate(Duration? pos) {
-    onProgressChanged?.call();
-    if (_chapterEndFired || !_player.playing) return;
-    final dur = _player.duration;
-    if (pos != null && dur != null &&
-        dur.inMilliseconds > 1000 &&
-        (dur.inMilliseconds - pos.inMilliseconds) < 500) {
-      _chapterEndFired = true;
-      if (!_manualSwitch) _onChapterComplete();
+  Future<void> _pollState() async {
+    try {
+      final s = await _nativePlayer.getState();
+      _isPlayingCache = s.isPlaying;
+      _speedCache = s.speed;
+      _positionCache = s.positionMs;
+      _durationCache = s.durationMs;
+
+      // 检测章节切换
+      if (s.currentIndex != _lastSeenIndex) {
+        _lastSeenIndex = s.currentIndex;
+        if (_currentIndex != s.currentIndex) {
+          _currentIndex = s.currentIndex;
+          if (!_manualSwitch) {
+            _onChapterComplete();
+          } else {
+            _manualSwitch = false;
+          }
+          _chapterEndFired = false;
+          onChapterChanged?.call();
+          _saveAllProgress();
+        }
+      }
+
+      // 位置接近末尾（<2秒）触发章节完成
+      if (_isPlayingCache &&
+          _durationCache > 0 &&
+          (_durationCache - _positionCache) < 2000 &&
+          !_chapterEndFired) {
+        _chapterEndFired = true;
+        _onChapterComplete();
+      }
+
+      // 进度保存
+      if (_isPlayingCache && _bookName.isNotEmpty) {
+        _saveCurrentChapterPosition(_positionCache);
+      }
+      onProgressChanged?.call();
+    } catch (e) {
+      debugPrint('pollState error: $e');
+    }
+  }
+
+  void _onChapterComplete() {
+    if (_sleepMode == SleepMode.chapters) {
+      _sleepRemainingChapters--;
+      if (_sleepRemainingChapters < 0) {
+        _stopSleep();
+        _nativePlayer.pause();
+      }
     }
   }
 
@@ -117,142 +150,178 @@ class PlayerService {
     _bookName = bookName;
     _chapters = chapters;
     _currentIndex = startIndex;
+    _lastSeenIndex = startIndex;
+    _manualSwitch = false;
+    _chapterEndFired = false;
 
-    // 构建播放列表（优先使用本地下载文件）
-    final audioSources = <AudioSource>[];
+    // 构建URL列表（优先用本地缓存路径）
+    final urls = <String>[];
+    final titles = <String>[];
     for (final ch in chapters) {
-      final fileName = ch.fileName;
-      final localPath = _downloadService != null
-          ? await _downloadService!.getLocalFile(bookName, fileName)
-          : null;
-
-      if (localPath != null) {
-        audioSources.add(AudioSource.file(localPath));
-      } else {
-        final url = _apiService.getAudioUrl(ch.file);
-        audioSources.add(AudioSource.uri(Uri.parse(url)));
-      }
+      final local = await _downloadService?.getLocalFile(bookName, ch.fileName);
+      final url = local ?? _apiService.getAudioUrl('${bookName}/${ch.fileName}');
+      debugPrint('loadBook: [$startIndex] ${ch.fileName} -> $url');
+      urls.add(url);
+      titles.add(ch.displayName);
     }
-
-    await _player.setAudioSource(
-      ConcatenatingAudioSource(children: audioSources),
-      initialIndex: startIndex,
-      initialPosition: Duration(milliseconds: startPositionMs),
-    );
+    _lastAudioUrl = urls.isNotEmpty ? urls[0] : '';
 
     // 恢复该书的播放速度
     final savedSpeed = _storageService?.getSpeed(bookName) ?? 1.0;
-    if (savedSpeed != 1.0) await _player.setSpeed(savedSpeed);
+    _speedCache = savedSpeed;
 
-    if (startPositionMs > 0) {
-      await _player.seek(Duration(milliseconds: startPositionMs));
+    await _nativePlayer.loadBook(
+      chapterUrls: urls,
+      chapterTitles: titles,
+      startIndex: startIndex,
+      startMs: startPositionMs,
+    );
+
+    if (savedSpeed != 1.0) {
+      await _nativePlayer.setSpeed(savedSpeed);
     }
-    _updateMeta();
   }
 
-  /// 跳转到指定章节从头播放
+  Future<void> play() => _nativePlayer.play();
+  Future<void> pause() => _nativePlayer.pause();
+
+  /// 跳转到指定章节播放
   Future<void> playChapter(int index) async {
     if (index < 0 || index >= _chapters.length) return;
     _manualSwitch = true;
-    _currentIndex = index;         // 先赋值，防止currentIndexStream触发_onChapterComplete
-    await _player.seek(Duration.zero, index: index);
-    await _player.play();
-    onChapterChanged?.call();
+    _currentIndex = index;
+    _lastSeenIndex = index;
+    _chapterEndFired = false;
+    await _nativePlayer.seekToChapter(index);
+    await _nativePlayer.play();
   }
 
-  /// 跳转到指定章节并从指定位置播放（用于恢复进度）
-  Future<void> playChapterAt(int index, int startMs) async {
+  Future<void> seek(Duration position) async {
+    await _nativePlayer.seek(position.inMilliseconds);
+  }
+
+  Future<void> seekToChapter(int index) async {
     if (index < 0 || index >= _chapters.length) return;
     _manualSwitch = true;
     _currentIndex = index;
-    await _player.seek(Duration(milliseconds: startMs), index: index);
-    await _player.play();
-    onChapterChanged?.call();
+    _lastSeenIndex = index;
+    _chapterEndFired = false;
+    await _nativePlayer.seekToChapter(index);
   }
 
-  // ======= 播放控制 =======
-  Future<void> play() => _player.play();
-  Future<void> pause() => _player.pause();
-  Future<void> playPause() => _player.playing ? _player.pause() : _player.play();
+  Future<void> playChapterAt(int index, int startMs) async {
+    _manualSwitch = true;
+    _currentIndex = index;
+    _lastSeenIndex = index;
+    _chapterEndFired = false;
+    if (startMs > 0) {
+      await _nativePlayer.seekToChapter(index);
+      await _nativePlayer.seek(startMs);
+    } else {
+      await _nativePlayer.seekToChapter(index);
+    }
+    await _nativePlayer.play();
+  }
 
-  Future<void> skipNext() async {
-    if (_currentIndex < _chapters.length - 1) {
-      await playChapter(_currentIndex + 1);
+  Future<void> skipToNext() => _nativePlayer.skipNext();
+  Future<void> skipNext() => _nativePlayer.skipNext();
+  Future<void> skipToPrevious() => _nativePlayer.skipPrev();
+  Future<void> skipPrevious() => _nativePlayer.skipPrev();
+
+  Future<void> togglePlayPause() async {
+    if (_isPlayingCache) {
+      await _nativePlayer.pause();
+    } else {
+      await _nativePlayer.play();
     }
   }
 
-  Future<void> skipPrevious() async {
-    // 如果当前进度超过5秒，回到开头；否则上一集
-    if (_player.position.inSeconds > 5) {
-      await _player.seek(Duration.zero);
-    } else if (_currentIndex > 0) {
-      await playChapter(_currentIndex - 1);
-    }
+  Future<void> playPause() => togglePlayPause();
+
+  Future<void> seekRelative(int deltaMs) async {
+    final target = (_positionCache + deltaMs).clamp(0, _durationCache);
+    await _nativePlayer.seek(target);
   }
 
-  Future<void> seekRelative(int seconds) async {
-    final newPos = _player.position + Duration(seconds: seconds);
-    final clamped = Duration(
-      milliseconds: max(0, min(
-        newPos.inMilliseconds,
-        (_player.duration?.inMilliseconds ?? 0),
-      )),
-    );
-    await _player.seek(clamped);
+  Future<void> setSpeed(double speed) async {
+    await _nativePlayer.setSpeed(speed);
+    _speedCache = speed;
+    if (_bookName.isNotEmpty) await _storageService?.setSpeed(_bookName, speed);
   }
 
-  // ======= 定时关闭 =======
-  void startSleepTimer({int? minutes, int? chapters}) {
-    cancelSleepTimer();
+  // ===== 进度保存 =====
+  void _saveCurrentChapterPosition(int ms) {
+    if (_bookName.isEmpty) return;
+    _storageService?.saveChapterPosition(_bookName, _currentIndex, ms, _durationCache);
+  }
 
-    if (minutes != null && minutes > 0) {
-      _sleepMode = SleepMode.time;
+  void _saveAllProgress() {
+    if (_bookName.isEmpty) return;
+    _storageService?.saveChapterPosition(_bookName, _currentIndex, _positionCache, _durationCache);
+  }
+
+  Future<void> saveProgress() async => _saveAllProgress();
+
+  Map<String, dynamic> getProgressInfo() {
+    return {
+      'bookName': _bookName,
+      'chapterIndex': _currentIndex,
+      'positionMs': _positionCache,
+      'durationMs': _durationCache,
+    };
+  }
+
+  // ===== 定时关闭 =====
+  void startSleepTimer({int? minutes, int? chapters}) =>
+      setSleepTimer(minutes: minutes, chapters: chapters);
+
+  void cancelSleepTimer() {
+    _stopSleep();
+  }
+
+  void setSleepTimer({int? minutes, int? chapters}) {
+    _sleepTimer?.cancel();
+    if (minutes != null) {
+      _sleepMode = SleepMode.minutes;
       _sleepRemainingMinutes = minutes;
-      _sleepTimer = Timer.periodic(const Duration(minutes: 1), (_) {
+      _sleepTimer = Timer.periodic(const Duration(minutes: 1), (t) {
         _sleepRemainingMinutes--;
-        onProgressChanged?.call();
         if (_sleepRemainingMinutes <= 0) {
-          _player.pause();
-          cancelSleepTimer();
+          t.cancel();
+          _nativePlayer.pause();
+          _stopSleep();
         }
       });
     } else if (chapters != null && chapters >= 0) {
       _sleepMode = SleepMode.chapters;
-      _sleepRemainingChapters = chapters; // 0=本集播完停
+      _sleepRemainingChapters = chapters;
     }
   }
 
-  void cancelSleepTimer() {
+  void _stopSleep() {
     _sleepTimer?.cancel();
-    _sleepTimer = null;
     _sleepMode = SleepMode.off;
     _sleepRemainingMinutes = 0;
     _sleepRemainingChapters = 0;
   }
 
-  void _onChapterComplete() {
+  String get sleepRemainingText {
+    if (_sleepMode == SleepMode.minutes) return '${_sleepRemainingMinutes}分钟';
     if (_sleepMode == SleepMode.chapters) {
-      _sleepRemainingChapters--;
-      onProgressChanged?.call();
-      if (_sleepRemainingChapters <= 0) {
-        _player.pause();
-        cancelSleepTimer();
-      }
+      if (_sleepRemainingChapters == 0) return '本集完';
+      return '剩$_sleepRemainingChapters集';
     }
+    return '';
   }
 
-  /// 获取当前进度信息（用于保存）
-  Map<String, dynamic> getProgressInfo() {
-    return {
-      'chapterIndex': _currentIndex,
-      'positionMs': _player.position.inMilliseconds,
-    };
-  }
+  SleepMode get sleepMode => _sleepMode;
+  int get sleepRemainingMinutes => _sleepRemainingMinutes;
+  int get sleepRemainingChapters => _sleepRemainingChapters;
 
   void dispose() {
-    cancelSleepTimer();
-    _player.dispose();
+    _pollTimer?.cancel();
+    _sleepTimer?.cancel();
   }
 }
 
-enum SleepMode { off, time, chapters }
+enum SleepMode { off, minutes, chapters }

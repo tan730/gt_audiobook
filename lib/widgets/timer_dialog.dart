@@ -136,7 +136,7 @@ class _TimerDialogState extends State<TimerDialog> {
   }
 
   Widget _buildTimeChip(String label, int minutes) {
-    final isActive = widget.currentMode == SleepMode.time &&
+    final isActive = widget.currentMode == SleepMode.minutes &&
         (widget.remainingMinutes == minutes ||
             (widget.remainingMinutes >= minutes - 1 &&
                 widget.remainingMinutes <= minutes + 1));
