@@ -1,5 +1,5 @@
 name: audiobook
-description: "A new Flutter project."
+description: "轻量级有声小说播放器 — 把你下载的有声书放到自己的服务器上，直接播放，支持离线缓存。"
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
