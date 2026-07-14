@@ -238,7 +238,10 @@ class PlayerService {
 
   Future<void> playPause() => togglePlayPause();
 
-  Future<void> seekRelative(int deltaMs) async {
+  /// 相对当前位置跳转，单位 = 秒（内部转成 ms 传给原生）
+  /// 之所以用秒为单位，是因为 UI 上 forward_10 / replay_10 图标就是 10 秒的概念
+  Future<void> seekRelative(int deltaSeconds) async {
+    final deltaMs = deltaSeconds * 1000;
     final target = (_positionCache + deltaMs).clamp(0, _durationCache);
     await _nativePlayer.seek(target);
   }

@@ -25,6 +25,7 @@ android/gradle/wrapper/gradle-*.zip
 build/
 *.apk
 *.aab
+*.apk.bak
 
 # The .vscode folder contains launch configuration and tasks you configure in
 # VS Code which you may wish to be included in version control, so this line
